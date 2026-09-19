@@ -236,6 +236,12 @@ int main(int argc, char *argv[]) {
         const int train_steps = ENTRIES_PER_BATCH * 5 * 2;
         x[i].Data = ((f64)entry_view.ImageData[i] - 127.5) / 127.5; // ~ [-1, 1]
         Test Accuracy: 37.070% loss avg: 1.833495
+
+        + bias
+        double lr = 0.001;
+        const int train_steps = ENTRIES_PER_BATCH * 5 * 1;
+        x[i].Data = ((f64)entry_view.ImageData[i] - 127.5) / 127.5; // ~ [-1, 1]
+        Test Accuracy: 37.440% loss avg: 1.807230
         
      */
 
@@ -273,6 +279,13 @@ int main(int argc, char *argv[]) {
 
     Matrix W = NewMatrix(CIFAR_CLASSES, MODEL_DIM, &weights_arena);
     LogArena(&weights_arena);
+    Value* bias = MemoryArenaPush(&weights_arena, sizeof(Value) * CIFAR_CLASSES);
+    for (int i = 0; i < CIFAR_CLASSES; i++) {
+        bias[i].Grad = 0.0;
+        bias[i].Data = 0.0;
+        bias[i].ChildCount = 0;
+    }
+
 
     MatrixRandomInit(&W);
 
@@ -299,9 +312,15 @@ int main(int argc, char *argv[]) {
         int y_idx = entry_view.Label;
         
         // forward
-        // W @ x
+        // W @ x + b
         Value** out = MemoryArenaPush(&scratch_arena, sizeof(Value*) * CIFAR_CLASSES);
         Linear(&W, out, x, &forward_arena);
+        for (int i = 0; i < CIFAR_CLASSES; i++) {
+            Value* elem_with_bias = NewValue(&forward_arena);
+            VAdd(elem_with_bias, out[i], &bias[i]);
+            out[i] = elem_with_bias;
+        }
+
         
         // calculate softmax and loss for correct label
         Value** probs = MemoryArenaPush(&scratch_arena, sizeof(Value*) * CIFAR_CLASSES);
@@ -315,13 +334,16 @@ int main(int argc, char *argv[]) {
         VNegative(loss, log_prob);
 
         if (train_steps <= 100 || step % 500 == 0) {
-            printf("step: %d, loss: %f b_i: %d e_i: %d\n", 
-                step+1, loss->Data, batch_idx, entry_idx);
+            printf("step: %d, loss: %.4f lr: %.5f, b_i: %d e_i: %d\n",
+                step+1, loss->Data, lr, batch_idx, entry_idx);
         }
         
         // zero grad
         for (int i = 0; i < W.RowCount * W.ColumnCount; i++)  {
             W.Elements[i].Grad = 0.0;
+        }
+        for (int i = 0; i < CIFAR_CLASSES; i++) {
+            bias[i].Grad = 0.0;
         }
 
         Backward(&forward_arena);
@@ -335,6 +357,10 @@ int main(int argc, char *argv[]) {
         for (int i = 0 ; i < W.RowCount * W.ColumnCount; i ++) {
             W.Elements[i].Data -= W.Elements[i].Grad * lr;
             W.Elements[i].Grad = 0.0;
+        }
+        for (int i = 0; i < CIFAR_CLASSES; i++) {
+            bias[i].Data -= bias[i].Grad * lr;
+            bias[i].Grad = 0.0;
         }
 
         if (step == 0 || step == train_steps - 1) {
@@ -374,6 +400,11 @@ int main(int argc, char *argv[]) {
         // W @ x
         Value** out = MemoryArenaPush(&scratch_arena, sizeof(Value*) * CIFAR_CLASSES);
         Linear(&W, out, x, &forward_arena);
+        for (int i = 0; i < CIFAR_CLASSES; i++) {
+            Value* elem_with_bias = NewValue(&forward_arena);
+            VAdd(elem_with_bias, out[i], &bias[i]);
+            out[i] = elem_with_bias;
+        }
         
         // calculate softmax and loss for correct label
         Value** probs = MemoryArenaPush(&scratch_arena, sizeof(Value*) * CIFAR_CLASSES);
