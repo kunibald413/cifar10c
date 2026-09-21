@@ -34,27 +34,92 @@ typedef struct Vector {
     f64* Data;
 } Vector;
 
+typedef struct Model {
+    Matrix *Layers;
+    int LayerCount;
+    Matrix FinalLayer;
+} Model;
+
+#define ARENA_ALIGN ((size_t)16)
+typedef struct MemoryArena {
+    byte* Base;
+    size_t Used;
+    size_t Capacity;
+} MemoryArena;
+
+MemoryArena CreateArena(size_t capacity) {
+    MemoryArena a;
+
+    void* ptr = calloc(capacity, sizeof(byte));
+    if (ptr == NULL) { 
+        fprintf(stderr, "failed to allocate arena bytes %zu\n", capacity); 
+        abort();
+    }
+    a.Base = (byte*)ptr;
+    a.Used = 0;
+    a.Capacity = capacity;
+
+    return a;
+}
+
+size_t GetArenaAlignOffset(MemoryArena *a, size_t alignment) {
+    size_t current_address = (size_t)(a->Base + a->Used);
+    size_t mask = alignment - 1;
+    if (current_address & mask) { // fast way to get remainder
+        return alignment - (current_address & mask);
+    }
+    return 0;
+}
+
+void* ArenaPushAligned(MemoryArena *a, size_t size, size_t alignment) {
+    size_t offset = GetArenaAlignOffset(a, alignment);
+    size_t total = size + offset;
+
+    if (total > a->Capacity - a->Used) {
+        fprintf(stderr,
+                "Arena out of capacity: requested %zu (with %zu align padding), "
+                "capacity %zu, used %zu, remaining %zu\n",
+                size, offset, a->Capacity, a->Used, a->Capacity - a->Used);
+        abort();
+    }
+
+    void* result = a->Base + a->Used + offset;
+    a->Used += total;
+    return result;
+}
+
+void* ArenaPush(MemoryArena *a, size_t size) {
+    return ArenaPushAligned(a, size, ARENA_ALIGN);
+}
+
+void LogArena(MemoryArena *a) {
+    printf("arena used: %zu cap: %zu (%.3f%%) current ptr: %p\n", 
+        a->Used, a->Capacity, 
+        (f64)a->Used / (f64)a->Capacity * 100.0,
+        a->Base + a->Used);
+}
+
 f64 RndF64() {
     return rand() / (f64)RAND_MAX;
 }
 
-Matrix CreateMatrix(int rows, int columns, f64 random_init_scale) {
-    Matrix W;
-    W.Data = calloc(rows * columns, sizeof(f64));
-    if (W.Data == NULL) {
+Matrix* CreateMatrix(MemoryArena *a, int rows, int columns, f64 random_init_scale) {
+    Matrix *wptr = (Matrix*)ArenaPush(a, sizeof(Matrix));
+    wptr->Data = (f64*)ArenaPush(a, rows * columns * sizeof(f64));
+    if (wptr->Data == NULL) {
         printf("failed to allocate matrix!\n");
         exit(1);
     }
-    W.RowCount = rows;
-    W.ColumnCount = columns;
+    wptr->RowCount = rows;
+    wptr->ColumnCount = columns;
 
     if (random_init_scale > 0.0) {
-        for (int i = 0; i < W.RowCount * W.ColumnCount; i ++) {
-            W.Data[i] = (RndF64() * 2 - 1) * random_init_scale;
+        for (int i = 0; i < wptr->RowCount * wptr->ColumnCount; i ++) {
+            wptr->Data[i] = (RndF64() * 2 - 1) * random_init_scale;
         }
     }
 
-    return W;
+    return wptr;
 }
 
 Vector NewVector(int length) {
@@ -202,6 +267,9 @@ int main(int argc, char *argv[]) {
 
     srand((u32)1234);
 
+    MemoryArena main_arena = CreateArena((size_t)(10 << 20));
+    MemoryArena scratch_arena = CreateArena((size_t)(1 << 20));
+
     // load data
     #define TRAIN_BATCH_COUNT 5
     CifarBatch train_batches[TRAIN_BATCH_COUNT];
@@ -217,61 +285,56 @@ int main(int argc, char *argv[]) {
     }
 
     // config
-    int train_steps = TRAIN_BATCH_COUNT * ENTRIES_PER_BATCH * 4;
+    int train_steps = TRAIN_BATCH_COUNT * ENTRIES_PER_BATCH * 1;
     f64 lr[3] = {0.005, 0.001, 0.0001};
     int RUN_TEST = 1;
     int KAIMING_INIT = 1;
     f64 reg = 0.0004;
 
+    train_steps = 1000;
 
     // model
     const int modeldim = IMG_SIZE;
     const int hiddendim = 32; 
     const int outdim = 10;
+    Model model;
 
-    /* 
-    
-        int train_steps = TRAIN_BATCH_COUNT * ENTRIES_PER_BATCH * 4;
-        f64 lr[3] = {0.005, 0.001, 0.0001};
-        int KAIMING_INIT = 1;
-        f64 reg = 0.0004;
-        32 -> 49.30%
-        256 -> 54.01%
-        
-    */
 
     f64 expected_loss = -log(1.0 / (f64)outdim);
 
     f64 init_scale1 = KAIMING_INIT ? sqrt(2.0 / (f64)modeldim) : 0.01;
-    Matrix W1 = CreateMatrix(hiddendim, modeldim, init_scale1);
-    Vector b1 = NewVector(W1.RowCount);
+    Matrix* W1 = CreateMatrix(&main_arena, hiddendim, modeldim, init_scale1);
+    Vector b1 = NewVector(W1->RowCount);
     for (int i = 0; i < b1.Length; i ++) { b1.Data[i] = 0.0; }
 
     f64 init_scale2 = KAIMING_INIT ? sqrt(2.0 / (f64)hiddendim) : 0.01;
-    Matrix W2 = CreateMatrix(outdim, hiddendim, init_scale2);
-    Vector b2 = NewVector(W2.RowCount);
-    for (int i = 0; i < b2.Length; i ++) { b2.Data[i] = 0.0; }
+    Matrix* w_out = CreateMatrix(&main_arena, outdim, hiddendim, init_scale2);
+    Vector b_out = NewVector(w_out->RowCount);
+    for (int i = 0; i < b_out.Length; i ++) { b_out.Data[i] = 0.0; }
 
     // grad buffers
-    Matrix dW = CreateMatrix(W1.RowCount, W1.ColumnCount, 0.0);
+    Matrix* dW = CreateMatrix(&main_arena, W1->RowCount, W1->ColumnCount, 0.0);
     Vector db = NewVector(b1.Length);
-    Vector dxout_relu = NewVector(W1.RowCount);
-    Matrix dW2 = CreateMatrix(W2.RowCount, W2.ColumnCount, 0.0);
-    Vector db2 = NewVector(b2.Length);
-    Vector dxout2 = NewVector(W2.RowCount);
+    Vector dxout_relu = NewVector(W1->RowCount);
+    
+    Matrix* dW2 = CreateMatrix(&main_arena, w_out->RowCount, w_out->ColumnCount, 0.0);
+    Vector db2 = NewVector(b_out.Length);
+    Vector dxout2 = NewVector(w_out->RowCount);
 
     // buffers
     Vector x = NewVector(modeldim);
-    Vector xout = NewVector(W1.RowCount);
+    Vector xout = NewVector(W1->RowCount);
     Vector xout_relu = NewVector(xout.Length);
-    Vector xout2 = NewVector(W2.RowCount);
-    assert(x.Length == W1.ColumnCount && "x W shape mismatch");
-    assert(b1.Length == W1.RowCount && "b W shape mismatch");
-    assert(xout.Length == W1.RowCount && "xout W shape mismatch");
-    assert(xout2.Length == W2.RowCount && "xout W shape mismatch");
+    Vector xout2 = NewVector(w_out->RowCount);
+    assert(x.Length == W1->ColumnCount && "x W shape mismatch");
+    assert(b1.Length == W1->RowCount && "b W shape mismatch");
+    assert(xout.Length == W1->RowCount && "xout W shape mismatch");
+    assert(xout2.Length == w_out->RowCount && "xout W shape mismatch");
 
     Vector xout_exp = NewVector(xout2.Length);
     Vector probs = NewVector(xout2.Length);
+
+    LogArena(&main_arena);
 
     
     for (int step = 0; step < train_steps; step ++) {
@@ -287,11 +350,11 @@ int main(int argc, char *argv[]) {
             // printf("inted x to %f\n", x.Data[i]);
         }
 
-        ModelForward(&W1, &b1, &W2, &b2, &x, &xout, &xout_relu, &xout2, &xout_exp, &probs);
+        ModelForward(W1, &b1, w_out, &b_out, &x, &xout, &xout_relu, &xout2, &xout_exp, &probs);
 
         f64 reg_loss = 0.0;
-        for (int i = 0; i < W1.RowCount * W1.ColumnCount; i ++) reg_loss += W1.Data[i] * W1.Data[i];
-        for (int i = 0; i < W2.RowCount * W2.ColumnCount; i ++) reg_loss += W2.Data[i] * W2.Data[i];
+        for (int i = 0; i < W1->RowCount * W1->ColumnCount; i ++) reg_loss += W1->Data[i] * W1->Data[i];
+        for (int i = 0; i < w_out->RowCount * w_out->ColumnCount; i ++) reg_loss += w_out->Data[i] * w_out->Data[i];
         reg_loss = reg_loss * reg * 0.5; // 0.5 so that grad = reg*W instead of 2*reg*W
         
         if (step < 10 || step % 1000 == 0 || step == train_steps - 1) {
@@ -304,22 +367,22 @@ int main(int argc, char *argv[]) {
         // backward
     
         // zero grads
-        memset(dW.Data, 0, W1.RowCount * W1.ColumnCount * sizeof(f64));
+        memset(dW->Data, 0, W1->RowCount * W1->ColumnCount * sizeof(f64));
         memset(db.Data, 0, b1.Length * sizeof(f64));
-        memset(dW2.Data, 0, W2.RowCount * W2.ColumnCount * sizeof(f64));
-        memset(db2.Data, 0, b2.Length * sizeof(f64));
+        memset(dW2->Data, 0, w_out->RowCount * w_out->ColumnCount * sizeof(f64));
+        memset(db2.Data, 0, b_out.Length * sizeof(f64));
     
-        Backward(&W1, &b1, &W2, &b2, 
+        Backward(W1, &b1, w_out, &b_out, 
             &x, &xout, &xout_relu, &xout2, &probs, y, 
-            &dW, &db, &dW2, &db2, &dxout2, &dxout_relu
+            dW, &db, dW2, &db2, &dxout2, &dxout_relu
         );
 
         // apply reg grads
-        for (int i = 0; i < W1.RowCount * W1.ColumnCount; i++) {
-            dW.Data[i] += reg * W1.Data[i];
+        for (int i = 0; i < W1->RowCount * W1->ColumnCount; i++) {
+            dW->Data[i] += reg * W1->Data[i];
         }
-        for (int i = 0; i < W2.RowCount * W2.ColumnCount; i++) {
-            dW2.Data[i] += reg * W2.Data[i];
+        for (int i = 0; i < w_out->RowCount * w_out->ColumnCount; i++) {
+            dW2->Data[i] += reg * w_out->Data[i];
         }
             
         // update weights, sgd
@@ -327,18 +390,18 @@ int main(int argc, char *argv[]) {
             ? 2 : step >= train_steps / 2 
             ? 1 : 0;
 
-        for (int i = 0; i < W1.RowCount * W1.ColumnCount; i++) {
-            W1.Data[i] -= lr[lr_idx] * dW.Data[i];
+        for (int i = 0; i < W1->RowCount * W1->ColumnCount; i++) {
+            W1->Data[i] -= lr[lr_idx] * dW->Data[i];
         }
         for (int i = 0; i < b1.Length; i++) {
             b1.Data[i] -= lr[lr_idx] * db.Data[i];
         }
 
-        for (int i = 0; i < W2.RowCount * W2.ColumnCount; i++) {
-            W2.Data[i] -= lr[lr_idx] * dW2.Data[i];
+        for (int i = 0; i < w_out->RowCount * w_out->ColumnCount; i++) {
+            w_out->Data[i] -= lr[lr_idx] * dW2->Data[i];
         }
-        for (int i = 0; i < b2.Length; i++) {
-            b2.Data[i] -= lr[lr_idx] * db2.Data[i];
+        for (int i = 0; i < b_out.Length; i++) {
+            b_out.Data[i] -= lr[lr_idx] * db2.Data[i];
         }
 
     }
@@ -358,7 +421,7 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < modeldim; i ++) {
             x.Data[i] = (entry_view.ImageData[i] - 127.5) / 127.5;
         }
-        ModelForward(&W1, &b1, &W2, &b2, &x, &xout, &xout_relu, &xout2, &xout_exp, &probs);
+        ModelForward(W1, &b1, w_out, &b_out, &x, &xout, &xout_relu, &xout2, &xout_exp, &probs);
 
         f64 loss = -log(probs.Data[y]);
         loss_accum += loss;
