@@ -42,6 +42,7 @@ typedef int32_t  i32;
 #define ENTRY_SIZE (1 + IMG_SIZE)    /* 3073  */
 #define ENTRIES_PER_BATCH 10000
 #define BYTES_PER_BATCH (ENTRIES_PER_BATCH * ENTRY_SIZE)
+#define TRAIN_BATCHES 5
 
 typedef struct CifarBatch {
     int EntryCount;

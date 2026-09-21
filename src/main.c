@@ -8,7 +8,6 @@ f64 RandomF64() {
 }
 
 #define ARENA_ALIGN ((size_t)16)
-#define TRAIN_BATCHES 5
 
 typedef struct MemoryArena {
     byte* Base;
