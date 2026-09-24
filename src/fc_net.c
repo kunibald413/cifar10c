@@ -35,9 +35,21 @@ typedef struct Vector {
 } Vector;
 
 
+typedef enum Activaton {
+    ACT_NONE,
+    ACT_RELU
+} Activaton;
+
 typedef struct Layer {
-    Matrix W; // (out, dim)
-    Vector b; // (out, )
+    Matrix W, dW; // (out, dim)
+    Vector b, db; // (out, )
+    Activaton Act;
+
+
+    Vector z; // pre activation
+    Vector a; // post activation
+    Vector Grad; // propagating gradient (out, )
+    Vector dinput; // grad of the loss w.r.t this layer's input (in, )
 } Layer;
 
 typedef struct Model {
@@ -141,14 +153,15 @@ Matrix* CreateMatrix(MemoryArena *a, int rows, int columns, f64 random_init_scal
 }
 
 
-void InitVector(Vector *v, int length) {
-    v->Data = calloc(length, sizeof(f64));
+void InitVector(MemoryArena *a, Vector *v, int length) {
+    v->Data = ArenaPush(a, sizeof(f64) * length);
     if (v->Data == NULL) { printf("failed to allocate for v!\n"); exit(1); }
     v->Length = length;
+    memset(v->Data, 0, sizeof(f64) * length);
 }
 Vector* NewVector(MemoryArena *a, int length) {
     Vector* v = ArenaPush(a, sizeof(Vector));
-    InitVector(v, length);
+    InitVector(a, v, length);
     return v;
 }
 
@@ -165,146 +178,148 @@ Model* CreateModel(MemoryArena *a, ModelCreateConfig * cfg) {
     Model* model = (Model*)ArenaPush(a, sizeof(Model));
     model->Layers = ArenaPush(a, sizeof(Layer) * cfg->LayerCount);
 
-    int indim = cfg->InputDim;
+    int in_dim = cfg->InputDim;
     for (int i = 0; i < cfg->LayerCount; i ++) {
-        int out = i == cfg->LayerCount - 1 ? cfg->OutputDim : cfg->HiddenDim;
-        f64 init_scale =  cfg->IsKaimingInit ? sqrt(2.0 / (f64)indim) : 0.01;
-        InitMatrix(a, &model->Layers[i].W, out, indim, init_scale);
+        int is_last = i == cfg->LayerCount - 1;
+        int out_dim = is_last ? cfg->OutputDim : cfg->HiddenDim;
+        f64 init_scale =  cfg->IsKaimingInit ? sqrt(6.0 / (f64)in_dim) : 0.01;
+        Activaton act = is_last ? ACT_NONE : ACT_RELU;
+        model->Layers[i].Act = act;
+        InitMatrix(a, &model->Layers[i].W, out_dim, in_dim, init_scale);
+        InitMatrix(a, &model->Layers[i].dW, out_dim, in_dim, 0.0);
+        InitVector(a, &model->Layers[i].b, out_dim);
+        InitVector(a, &model->Layers[i].db, out_dim);
+
+        InitVector(a, &model->Layers[i].z, out_dim);
+        InitVector(a, &model->Layers[i].a, out_dim);
+        InitVector(a, &model->Layers[i].Grad, out_dim);
+        InitVector(a, &model->Layers[i].dinput, in_dim);
+
+        in_dim = out_dim; // lord help me
     }
+    model->LayerCount = cfg->LayerCount;
     return model;
 }
 
+void Forward(Model *m, Vector *x) {
+    Vector* current_x = x;
 
-void ModelForward(Matrix *W, Vector *b, 
-    Matrix *W2, Vector *b2,
-    Vector *x, 
-    Vector *xout, Vector *xout_relu, 
-    Vector *xout2, 
-    Vector *xout_exp, Vector *probs
-) {
-    
-    assert(x->Length == W->ColumnCount && "W.col must mach x.length");
-    assert(b->Length == W->RowCount && "W.row must mach b.length");
-    assert(xout->Length == W->RowCount && "W.row must mach xout.length");
-
-    assert(xout_relu->Length == xout->Length     && "relu out must match relu in");
-
-    assert(W2->ColumnCount == xout_relu->Length && "W2.cols must match relu.len");
-    assert(b2->Length == W2->RowCount && "b2.len must match W2.rows");
-    assert(xout2->Length == W2->RowCount && "xout2.len must match W2.rows");
-
-    assert(xout2->Length == xout_exp->Length && "xout2 and xout_exp vector length mismatch");
-    assert(xout2->Length == probs->Length && "xout2 and probs vector length mismatch");
-
-    // W1 @ x + b
-    // out: (num_classes,)
-    for (int r = 0; r < W->RowCount; r ++) {
-        f64 dot = 0.0;
-        for (int c = 0; c < W->ColumnCount; c++) {
-            dot += W->Data[r * W->ColumnCount + c] * x->Data[c];
+    for (int i = 0; i < m->LayerCount; i ++) {
+        f64 *xdata = current_x->Data;
+        Layer* L = &m->Layers[i];
+        Matrix* W = &L->W;
+        Vector* b = &L->b;
+        assert(W->ColumnCount == current_x->Length);
+        for (int r = 0; r < W->RowCount; r ++) {
+            f64 dot = 0.0;
+            for (int c = 0; c < W->ColumnCount; c++) {
+                dot += W->Data[r * W->ColumnCount + c] * xdata[c];
+            }
+            L->z.Data[r] = dot + b->Data[r];
         }
-        xout->Data[r] = dot + b->Data[r];
-    }
-
-    // for (int i = 0; i < xout->Length; i ++) { printf("xout value %f\n", xout->Data[i]); }
-    
-    // relu
-    ReLU(xout, xout_relu);
-
-    // W2 @ x + b2
-    for (int r = 0; r < W2->RowCount; r ++) {
-        f64 dot = 0.0;
-        for (int c = 0; c < W2->ColumnCount; c++) {
-            dot += W2->Data[r * W2->ColumnCount + c] * xout_relu->Data[c];
+        if (m->Layers[i].Act == ACT_RELU) {
+            ReLU(&L->z, &L->a);
+        } else {
+            memcpy(L->a.Data, L->z.Data, sizeof(f64) * L->z.Length);
         }
-        xout2->Data[r] = dot + b2->Data[r];
+        current_x = &L->a;
     }
-
-    // softmax
-    f64 exp_sum = 0.0;
-    f64 max_logit = xout2->Data[0];
-    for (int i = 0; i < xout2->Length; i ++) {
-        if (xout2->Data[i] > max_logit) max_logit = xout2->Data[i];
-    }
-
-    // (num_classes,)
-    for (int i = 0; i < xout_exp->Length; i ++) {
-        xout_exp->Data[i] = exp(xout2->Data[i] - max_logit);
-        exp_sum += xout_exp->Data[i];
-    }
-
-    //for (int i = 0; i < xout_exp->Length; i ++) { printf("xout_exp->value %f\n", xout_exp->Data[i]); }
-    //printf("exp_sum: %f\n", exp_sum);
-    
-    // (num_classes,)
-    for (int i = 0; i < xout_exp->Length; i ++) {
-        probs->Data[i] = xout_exp->Data[i] / exp_sum;
-        // printf("probs value %f\n", probs.Data[i]);
-    }
-    
 }
 
-void Backward(
-    // forward buffers
-    Matrix *W, Vector *b, Matrix *W2, Vector *b2,
-    Vector *x, Vector *xout, Vector *xout_relu, Vector *xout2, Vector *probs,
-    int y,
-    // grad buffers
-    Matrix *dW, Vector *db, Matrix *dW2, Vector *db2,
-    Vector *dxout2, Vector *dxout_relu
-) {
-    // fused softmax and crossentropy
-    // full graph (exp -> sum -> div -> log) is a pile of shit 
-    // but every intermediate derivative cancels to to just: 
-    //    dL/dz_i = p_i - (i == y ? 1 : 0)
-    for (int i = 0; i < dxout2->Length; i++) {
-        dxout2->Data[i] = probs->Data[i];
+void Softmax(Vector *logits, Vector *probs) {
+    f64 max_logit = logits->Data[0];
+    // max for numerical stability
+    // exp(logit - max)
+    // divide by sum
+    for (int i = 1; i < logits->Length; i++) {
+        if (logits->Data[i] > max_logit) max_logit = logits->Data[i];
     }
-    dxout2->Data[y] -= 1.0;
 
-    // W2
-    // xout2 = W2 @ xout_relu + b2
-    for (int r = 0; r < W2->RowCount; r++) {
-        db2->Data[r] = dxout2->Data[r];
-        for (int c = 0; c < W2->ColumnCount; c++) {
-            dW2->Data[r * W2->ColumnCount + c] = dxout2->Data[r] * xout_relu->Data[c];
+    f64 sum = 0.0;
+    for (int i = 0; i < logits->Length; i++) {
+        probs->Data[i] = exp(logits->Data[i] - max_logit);
+        sum += probs->Data[i];
+    }
+    for (int i = 0; i < logits->Length; i++) {
+        probs->Data[i] /= sum;
+    }
+}
+
+void Backward(Model *m, Vector *x, int y) {
+
+    // x => W1(x) + b1 -> z1 => ReLU(z1) -> a1 => W2(a1) + b2 -> logits => softmax(logits) -> probs
+
+    int n = m->LayerCount;
+
+    // start at last ("head") layer
+    Layer *last = &m->Layers[n - 1];
+    Vector *logits = &last->a;
+
+    // softmax backprop
+    // first compute probs
+    Softmax(logits, &last->Grad);
+
+    // if we incrase prob for the right label, the loss goes down
+    // meaning the grad there is negative
+    // which is what we want for the correct label
+    // for all other labels keepign the grads positive is signaling
+    // that if the model increases those probs the loss will go up 
+    // which we want (positive grad will push logits down in DG, and negative grad up)
+    // so this pushes the logits towards their indented probablity, y -> 1.0, rest -> 0.0
+    last->Grad.Data[y] -= 1.0;
+
+    // layers from the back
+    for (int i = n - 1; i >= 0; i--) {
+        Layer  *L     = &m->Layers[i];
+        Vector *input = (i == 0) ? x : &m->Layers[i - 1].a;
+
+        // activation
+        if (L->Act == ACT_RELU) {
+            for (int k = 0; k < L->z.Length; k++) {
+                L->Grad.Data[k] = L->z.Data[k] > 0.0 ? L->Grad.Data[k] : 0.0;
+            }
         }
-    }
 
-    for (int c = 0; c < W2->ColumnCount; c++) {
-        f64 sum = 0.0;
-        for (int r = 0; r < W2->RowCount; r++) {
-            sum += W2->Data[r * W2->ColumnCount + c] * dxout2->Data[r];
+        // dL/dW, gradient wrt the weights
+        // (how does the loss change if we chang the weights)
+        for (int r = 0; r < L->W.RowCount; r++) {
+            L->db.Data[r] = L->Grad.Data[r];
+            f64 *dWrow = &L->dW.Data[r * L->W.ColumnCount];
+            for (int c = 0; c < L->W.ColumnCount; c++) {
+                dWrow[c] = L->Grad.Data[r] * input->Data[c];
+            }
         }
-        dxout_relu->Data[c] = sum;
-    }
 
-    // relu
-    // max(0, x) means no gradiesnt when below 0
-    for (int i = 0; i < dxout_relu->Length; i++) {
-        dxout_relu->Data[i] = xout->Data[i] > 0.0 ? dxout_relu->Data[i] : 0.0;
-    }
+        // dL/dinput, gradient wrt input
+        // (how does the loss change if we change the input)
+        // need them to chain grad upwards to previous layer
+        for (int c = 0; c < L->W.ColumnCount; c++) {
+            // dot product is summing products,
+            // derivative of a sum is a sum of derivatives (over the row)
+            f64 sum = 0.0;
+            for (int r = 0; r < L->W.RowCount; r++) {
+                sum += L->W.Data[r * L->W.ColumnCount + c] * L->Grad.Data[r];
+            }
+            L->dinput.Data[c] = sum;
+        }
 
-
-    // W1
-    for (int r = 0; r < W->RowCount; r++) {
-        // bias grad is just 1, so simplified from dxout_relu.Data[r] * 1
-        db->Data[r] = dxout_relu->Data[r]; 
-        
-        for (int c = 0; c < W->ColumnCount; c++) { 
-            // in forward weight param just mutliplies elementwise with input (x)
-            // local grad for weight param is then just the x elem
-            dW->Data[r * W->ColumnCount + c] = dxout_relu->Data[r] * x->Data[c];
+        if (i > 0) {
+            Layer *prev = &m->Layers[i - 1];
+            assert(L->dinput.Length == prev->Grad.Length);
+            // input of this layer is output of prev layer
+            // flow grad backward, next iteration treads Grad.Data as grad of activations
+            memcpy(prev->Grad.Data, L->dinput.Data, sizeof(f64) * L->dinput.Length);
         }
     }
 }
+
 
 
 int main(int argc, char *argv[]) {
 
     srand((u32)1234);
 
-    MemoryArena main_arena = CreateArena((size_t)(30 << 20));
+    MemoryArena main_arena = CreateArena((size_t)(10 << 20));
     MemoryArena scratch_arena = CreateArena((size_t)(1 << 20));
 
     // load data
@@ -322,62 +337,29 @@ int main(int argc, char *argv[]) {
     }
 
     // config
-    int train_steps = TRAIN_BATCH_COUNT * ENTRIES_PER_BATCH * 1;
+    int train_steps = TRAIN_BATCH_COUNT * ENTRIES_PER_BATCH * 2;
     f64 lr[3] = {0.005, 0.001, 0.0001};
     int RUN_TEST = 1;
     int KAIMING_INIT = 1;
     f64 reg = 0.0004;
 
-    train_steps = 1000;
-
     // model
     const int modeldim = IMG_SIZE;
-    const int hiddendim = 32; 
+    const int hiddendim = 24; 
     const int outdim = 10;
     f64 expected_loss = -log(1.0 / (f64)outdim);
 
     ModelCreateConfig cfg = {
         .InputDim = IMG_SIZE,
-        .HiddenDim = 32,
+        .HiddenDim = hiddendim,
         .OutputDim = outdim,
         .IsKaimingInit = KAIMING_INIT,
-        .LayerCount = 1,
+        .LayerCount = 2,
     };
     Model* model = CreateModel(&main_arena, &cfg);
 
-
-
-    f64 init_scale1 = KAIMING_INIT ? sqrt(2.0 / (f64)modeldim) : 0.01;
-    Matrix* W1 = CreateMatrix(&main_arena, hiddendim, modeldim, init_scale1);
-    Vector* b1 = NewVector(&main_arena, W1->RowCount);
-    for (int i = 0; i < b1->Length; i ++) { b1->Data[i] = 0.0; }
-
-    f64 init_scale2 = KAIMING_INIT ? sqrt(2.0 / (f64)hiddendim) : 0.01;
-    Matrix* w_out = CreateMatrix(&main_arena, outdim, hiddendim, init_scale2);
-    Vector* b_out = NewVector(&main_arena, w_out->RowCount);
-    for (int i = 0; i < b_out->Length; i ++) { b_out->Data[i] = 0.0; }
-
-    // grad buffers
-    Matrix* dW = CreateMatrix(&main_arena, W1->RowCount, W1->ColumnCount, 0.0);
-    Vector* db = NewVector(&main_arena, b1->Length);
-    Vector* dxout_relu = NewVector(&main_arena, W1->RowCount);
-    
-    Matrix* dW2 = CreateMatrix(&main_arena, w_out->RowCount, w_out->ColumnCount, 0.0);
-    Vector* db2 = NewVector(&main_arena, b_out->Length);
-    Vector* dxout2 = NewVector(&main_arena, w_out->RowCount);
-
-    // buffers
     Vector* x = NewVector(&main_arena, modeldim);
-    Vector* xout = NewVector(&main_arena, W1->RowCount);
-    Vector* xout_relu = NewVector(&main_arena, xout->Length);
-    Vector* xout2 = NewVector(&main_arena, w_out->RowCount);
-    assert(x->Length == W1->ColumnCount && "x W shape mismatch");
-    assert(b1->Length == W1->RowCount && "b W shape mismatch");
-    assert(xout->Length == W1->RowCount && "xout W shape mismatch");
-    assert(xout2->Length == w_out->RowCount && "xout W shape mismatch");
-
-    Vector* xout_exp = NewVector(&main_arena, xout2->Length);
-    Vector* probs = NewVector(&main_arena, xout2->Length);
+    Vector* probs = NewVector(&main_arena, outdim);
 
     LogArena(&main_arena);
 
@@ -395,60 +377,50 @@ int main(int argc, char *argv[]) {
             // printf("inted x to %f\n", x.Data[i]);
         }
 
-        ModelForward(W1, b1, w_out, b_out, x, xout, xout_relu, xout2, xout_exp, probs);
+        Forward(model, x);
 
-        f64 reg_loss = 0.0;
-        for (int i = 0; i < W1->RowCount * W1->ColumnCount; i ++) reg_loss += W1->Data[i] * W1->Data[i];
-        for (int i = 0; i < w_out->RowCount * w_out->ColumnCount; i ++) reg_loss += w_out->Data[i] * w_out->Data[i];
-        reg_loss = reg_loss * reg * 0.5; // 0.5 so that grad = reg*W instead of 2*reg*W
-        
         if (step < 10 || step % 1000 == 0 || step == train_steps - 1) {
+            Layer *last = &model->Layers[model->LayerCount - 1];
+            Softmax(&last->a, probs);
+
+            f64 reg_loss = 0.0;
+            for (int i = 0; i < model->LayerCount; i++) {
+                Layer *L = &model->Layers[i];
+                int n = L->W.RowCount * L->W.ColumnCount;
+                for (int k = 0; k < n; k++)
+                    reg_loss += L->W.Data[k] * L->W.Data[k];
+            }
+            reg_loss *= reg * 0.5;
+
             f64 loss = -log(probs->Data[y]) + reg_loss;
-            printf("step %d loss: %.3f (reg_l: %.3f), expected init loss: %.3f \n", 
+            printf("step %d loss: %.3f (reg_l: %.3f), expected init loss: %.3f\n",
                 step, loss, reg_loss, expected_loss);
         }
     
     
         // backward
-    
-        // zero grads
-        memset(dW->Data, 0, W1->RowCount * W1->ColumnCount * sizeof(f64));
-        memset(db->Data, 0, b1->Length * sizeof(f64));
-        memset(dW2->Data, 0, w_out->RowCount * w_out->ColumnCount * sizeof(f64));
-        memset(db2->Data, 0, b_out->Length * sizeof(f64));
-    
-        Backward(W1, b1, w_out, b_out, 
-            x, xout, xout_relu, xout2, probs, y, 
-            dW, db, dW2, db2, dxout2, dxout_relu
-        );
+        Backward(model, x, y);
 
-        // apply reg grads
-        for (int i = 0; i < W1->RowCount * W1->ColumnCount; i++) {
-            dW->Data[i] += reg * W1->Data[i];
-        }
-        for (int i = 0; i < w_out->RowCount * w_out->ColumnCount; i++) {
-            dW2->Data[i] += reg * w_out->Data[i];
-        }
-            
         // update weights, sgd
         int lr_idx = step >= (int)((f64)train_steps * 0.9) 
             ? 2 : step >= train_steps / 2 
             ? 1 : 0;
 
-        for (int i = 0; i < W1->RowCount * W1->ColumnCount; i++) {
-            W1->Data[i] -= lr[lr_idx] * dW->Data[i];
-        }
-        for (int i = 0; i < b1->Length; i++) {
-            b1->Data[i] -= lr[lr_idx] * db->Data[i];
-        }
+        for (int i = 0; i < model->LayerCount; i++) {
+            Layer *L = &model->Layers[i];
 
-        for (int i = 0; i < w_out->RowCount * w_out->ColumnCount; i++) {
-            w_out->Data[i] -= lr[lr_idx] * dW2->Data[i];
+            // L2 grad
+            for (int k = 0; k < L->W.RowCount * L->W.ColumnCount; k++) {
+                L->dW.Data[k] += reg * L->W.Data[k];
+            }
+            // update w
+            for (int k = 0; k < L->W.RowCount * L->W.ColumnCount; k++) {
+                L->W.Data[k] -= lr[lr_idx] * L->dW.Data[k];
+            }
+            for (int k = 0; k < L->b.Length; k++) {
+                L->b.Data[k] -= lr[lr_idx] * L->db.Data[k];
+            }
         }
-        for (int i = 0; i < b_out->Length; i++) {
-            b_out->Data[i] -= lr[lr_idx] * db2->Data[i];
-        }
-
     }
 
     LogArena(&main_arena);
@@ -459,28 +431,29 @@ int main(int argc, char *argv[]) {
     // RUN_TEST
     printf("Running test...\n");
     CifarBatch test_batch = LoadCifarBatch("data/cifar-10-batches-bin/test_batch.bin");
+    Layer *last = &model->Layers[model->LayerCount - 1];
+
     f64 loss_accum = 0.0;
     int correct_predictions = 0;
-    for (int i = 0; i < ENTRIES_PER_BATCH; i ++) {
+    for (int i = 0; i < ENTRIES_PER_BATCH; i++) {
         CifarEntryView entry_view = GetEntryView(test_batch, i % ENTRIES_PER_BATCH);
         int y = entry_view.Label;
-        for (int i = 0; i < modeldim; i ++) {
-            x->Data[i] = (entry_view.ImageData[i] - 127.5) / 127.5;
+        for (int j = 0; j < modeldim; j++) {
+            x->Data[j] = (entry_view.ImageData[j] - 127.5) / 127.5;
         }
-        ModelForward(W1, b1, w_out, b_out, x, xout, xout_relu, xout2, xout_exp, probs);
 
-        f64 loss = -log(probs->Data[y]);
-        loss_accum += loss;
+        Forward(model, x);
+        Softmax(&last->a, probs);
+
+        loss_accum += -log(probs->Data[y]);
 
         int predicted_y = 0;
-        for (int i = 1; i < outdim; i++) {
-            if (probs->Data[i] > probs->Data[predicted_y]) predicted_y = i;
-        }
+        for (int k = 1; k < outdim; k++)
+            if (probs->Data[k] > probs->Data[predicted_y]) predicted_y = k;
         if (predicted_y == y) correct_predictions++;
-
-        // printf("loss: %.4f, \n", loss, expected_loss);
     }
 
+    printf("model: layers: %d h: %d t_steps: %d\n", model->LayerCount, hiddendim, train_steps);
     printf("Test Accuracy: %.2f%% loss avg: %f\n", 
         100.0 * (f64)correct_predictions / (f64)ENTRIES_PER_BATCH,
         loss_accum / (f64)ENTRIES_PER_BATCH);
